@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from random import Random
 
-from models import CompanyPolicy, ExpenseItemView, ScenarioInstance
+from server.models import CompanyPolicy, ExpenseItemView, ScenarioInstance
 
 
 _VALID_SCENARIOS = {"easy", "medium", "hard"}

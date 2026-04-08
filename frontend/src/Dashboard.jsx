@@ -4,261 +4,210 @@ import AIInsights from "./AIInsights";
 
 const API_BASE = "http://127.0.0.1:8000";
 
-const normalize = (value) => String(value || "").trim().toLowerCase();
+const resolveObservation = (payload) => payload?.observation ?? payload ?? null;
 
 const resolveItemId = (item, index) =>
-  item?.id ?? item?.item_id ?? item?.expense_id ?? `item-${index}`;
+  item?.item_id ?? item?.id ?? item?.expense_id ?? `item-${index}`;
+
+const normalizeActionType = (value) => String(value || "").trim().toLowerCase();
+
+const normalize = (value) => String(value || "").trim().toLowerCase();
 
 const getRiskLabel = (score) => {
   const numeric = Number(score);
   if (!Number.isFinite(numeric)) return "LOW";
-  if (numeric < 0.3) return "LOW";
-  if (numeric < 0.8) return "MEDIUM";
-  return "HIGH";
-};
-
-const getRiskBucket = (riskValue) => {
-  if (typeof riskValue === "string") {
-    const upper = riskValue.trim().toUpperCase();
-    if (upper === "HIGH") return "HIGH";
-    if (upper === "MEDIUM") return "MEDIUM";
-    if (upper === "LOW") return "LOW";
-    return getRiskLabel(riskValue);
-  }
-
-  return getRiskLabel(riskValue);
+  if (numeric > 0.8) return "HIGH";
+  if (numeric > 0.3) return "MEDIUM";
+  return "LOW";
 };
 
 const getRiskPresentation = (riskValue) => {
-  const bucket = getRiskBucket(riskValue);
-  if (bucket === "HIGH") {
+  const label = getRiskLabel(riskValue);
+  if (label === "HIGH") {
     return {
       label: "HIGH RISK",
       badgeClass: "bg-red-100 text-red-700",
-      cardClass: "border-red-300 shadow-[0_0_15px_rgba(255,0,0,0.3)]",
+      cardClass: "border-red-300 shadow-[0_0_15px_rgba(255,0,0,0.18)]",
     };
   }
-  if (bucket === "MEDIUM") {
+  if (label === "MEDIUM") {
     return {
       label: "MEDIUM RISK",
       badgeClass: "bg-yellow-100 text-yellow-700",
-      cardClass: "",
+      cardClass: "border-yellow-200",
     };
   }
   return {
     label: "LOW RISK",
     badgeClass: "bg-green-100 text-green-700",
-    cardClass: "",
+    cardClass: "border-white/50",
   };
 };
 
-const getSeverityPresentation = (severityValue) => {
-  const severity = String(severityValue || "").trim().toUpperCase();
-  if (severity === "HIGH") {
-    return {
-      label: "HIGH",
-      badgeClass: "bg-red-100 text-red-700 border-red-200",
-      barClass: "bg-red-500",
-    };
-  }
-  if (severity === "MEDIUM") {
-    return {
-      label: "MEDIUM",
-      badgeClass: "bg-amber-100 text-amber-700 border-amber-200",
-      barClass: "bg-amber-500",
-    };
-  }
-  if (severity === "LOW") {
-    return {
-      label: "LOW",
-      badgeClass: "bg-emerald-100 text-emerald-700 border-emerald-200",
-      barClass: "bg-emerald-500",
-    };
-  }
-  return {
-    label: "UNKNOWN",
-    badgeClass: "bg-slate-100 text-slate-700 border-slate-200",
-    barClass: "bg-slate-400",
-  };
+const getStatusBadgeClass = (status) => {
+  if (status === "flagged") return "bg-rose-100 text-rose-700 border-rose-200";
+  if (status === "approved") return "bg-emerald-100 text-emerald-700 border-emerald-200";
+  return "bg-slate-100 text-slate-600 border-slate-200";
 };
 
-const getSeverityPresentationFromScore = (riskScore) => {
-  const severity = getRiskLabel(riskScore);
-  return getSeverityPresentation(severity);
-};
-
-const clampRiskScore = (value) => {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return 0;
-  return Math.max(0, Math.min(1, numeric));
-};
-
-const getSuggestedFlagReason = ({
-  item,
-  itemId,
-  policy,
-  riskByItem,
-  allowedReasonCodes,
-}) => {
+const getSuggestedFlagReason = ({ item, itemId, policy, riskByItem, allowedReasonCodes }) => {
   const safePolicy = policy || {};
   const safeRiskMap = riskByItem || {};
   const safeAllowedCodes = Array.isArray(allowedReasonCodes) ? allowedReasonCodes : [];
-
   const forbiddenMerchants = new Set(
     (safePolicy.forbidden_merchants || []).map((merchant) => normalize(merchant))
   );
-  const capsByCategory = safePolicy.caps_by_category || {};
-
   const merchant = normalize(item?.merchant_descriptor || item?.merchant);
   const amount = Number(item?.submitted_amount ?? item?.amount ?? 0);
   const category = item?.submitted_category || item?.category;
-  const categoryCap = Number(capsByCategory?.[category]);
-  const riskBucket = getRiskLabel(safeRiskMap[itemId]);
+  const categoryCap = Number(safePolicy?.caps_by_category?.[category]);
+  const risk = Number(safeRiskMap?.[itemId]);
 
-  if (forbiddenMerchants.has(merchant)) {
+  if (forbiddenMerchants.has(merchant) && safeAllowedCodes.includes("FORBIDDEN_MERCHANT")) {
     return {
-      action: "FLAG",
       reasonCode: "FORBIDDEN_MERCHANT",
       displayText: "AI Suggestion: Flag (Forbidden Merchant)",
     };
   }
 
-  if (Number.isFinite(categoryCap) && amount > categoryCap) {
+  if (Number.isFinite(categoryCap) && amount > categoryCap && safeAllowedCodes.includes("OVER_CAP")) {
     return {
-      action: "FLAG",
       reasonCode: "OVER_CAP",
       displayText: "AI Suggestion: Flag (Over Cap)",
     };
   }
 
-  if (riskBucket === "HIGH") {
-    const highRiskReason = safeAllowedCodes.includes("HIGH_RISK")
-      ? "HIGH_RISK"
-      : safeAllowedCodes.includes("NEEDS_INFO")
-        ? "NEEDS_INFO"
-        : safeAllowedCodes[0] || "NEEDS_INFO";
-
+  if (risk > 0.8 && safeAllowedCodes.includes("NEEDS_INFO")) {
     return {
-      action: "FLAG",
-      reasonCode: highRiskReason,
-      displayText: "AI Suggestion: Flag (High Risk)",
+      reasonCode: "NEEDS_INFO",
+      displayText: "AI Suggestion: Flag (Needs Review)",
     };
   }
 
   return {
-    action: "APPROVE",
-    reasonCode: "",
-    displayText: "AI Suggestion: Approve",
+    reasonCode: safeAllowedCodes[0] || "FORBIDDEN_MERCHANT",
+    displayText: "AI Suggestion: Review Transaction",
   };
 };
 
 export default function Dashboard() {
   const [observation, setObservation] = useState(null);
   const [items, setItems] = useState([]);
-  const [itemStatuses, setItemStatuses] = useState({});
-  const [riskScores, setRiskScores] = useState({});
-  const [reviewedCountState, setReviewedCountState] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const [itemStatus, setItemStatus] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
   const [mounted, setMounted] = useState(false);
   const [showFlagModal, setShowFlagModal] = useState(false);
   const [selectedItem, setSelectedItem] = useState(null);
   const [selectedReason, setSelectedReason] = useState("");
-  const [suggestedReason, setSuggestedReason] = useState("");
-
-  const [actionLoading, setActionLoading] = useState(false);
-  const [pendingItemId, setPendingItemId] = useState(null);
-  const [pendingAction, setPendingAction] = useState("");
   const [expandedExplanations, setExpandedExplanations] = useState({});
   const hasReset = useRef(false);
 
-  const syncFromObservation = (nextObservation) => {
-    const safeObservation = { ...(nextObservation || {}) };
-    const base = safeObservation?.state || safeObservation;
-    console.log("STATUS MAP FROM BACKEND:", base);
-    const nextItems = Array.isArray(base?.items) ? [...base.items] : [];
-    const nextItemStatusMap = {
-      ...(base?.item_statuses || base?.item_status || base?.item_status_map || {}),
-    };
-    const nextRiskScores = {
-      ...(base?.risk_scores ||
-        base?.risk_by_item ||
-        base?.risk_map ||
-        {}),
-    };
+  const syncFromBackend = (payload) => {
+    const nextObservation = resolveObservation(payload);
+    if (!nextObservation) {
+      throw new Error("Missing observation in backend response");
+    }
 
-    const reviewedCount =
-      typeof base?.reviewed_count === "number"
-        ? base.reviewed_count
-        : Object.values(nextItemStatusMap).filter((status) => status !== "unreviewed")
-            .length;
-
-    console.log("UPDATED STATUS MAP:", nextItemStatusMap);
-    setObservation(JSON.parse(JSON.stringify(base)));
-    setItems(JSON.parse(JSON.stringify(nextItems)));
-    setItemStatuses(JSON.parse(JSON.stringify(nextItemStatusMap)));
-    setRiskScores(JSON.parse(JSON.stringify(nextRiskScores)));
-    setReviewedCountState(() => reviewedCount);
+    setObservation(nextObservation);
+    setItems(Array.isArray(nextObservation.items) ? nextObservation.items : []);
+    setItemStatus(nextObservation.item_status || {});
   };
 
-  const resetEnvironment = async () => {
-    setMounted(true);
-    console.log("RESET CALLED");
-    console.count("RESET TRIGGERED");
+  const handleStep = async (body) => {
+    if (loading) return;
+
+    const actionType = normalizeActionType(body?.action_type);
+    const itemId =
+      body?.item_id == null || body?.item_id === ""
+        ? undefined
+        : String(body.item_id).trim().toUpperCase();
+    const requestBody = {
+      ...body,
+      action_type: actionType,
+      ...(itemId ? { item_id: itemId } : {}),
+    };
+
+    console.log("Audit action:", {
+      action_type: requestBody.action_type,
+      item_id: requestBody.item_id ?? null,
+    });
+
+    setLoading(true);
+    setError("");
 
     try {
-      const res = await fetch(`${API_BASE}/reset`, {
+      const response = await fetch(`${API_BASE}/step`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ seed: 42 }),
+        body: JSON.stringify(requestBody),
       });
-      const response = await res.json();
-      console.log("RESET RESPONSE", response);
-      syncFromObservation(response?.observation);
-      setExpandedExplanations({});
+
+      if (!response.ok) {
+        throw new Error(`Step failed with status ${response.status}`);
+      }
+
+      const data = await response.json();
+      syncFromBackend(data);
     } catch (err) {
-      console.error(err);
+      console.error("Step error:", err);
+      setError("Unable to complete action. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
+  const handleReset = async () => {
+    if (loading) return;
+
+    setLoading(true);
+    setError("");
+    setShowFlagModal(false);
+    setSelectedItem(null);
+    setSelectedReason("");
+    setExpandedExplanations({});
+
+    try {
+      const response = await fetch(`${API_BASE}/reset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenario: "easy", seed: 0 }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Reset failed with status ${response.status}`);
+      }
+
+      const data = await response.json();
+      syncFromBackend(data);
+    } catch (err) {
+      console.error("Reset error:", err);
+      setError("Unable to load audit scenario.");
+      setObservation(null);
+      setItems([]);
+      setItemStatus({});
+    } finally {
+      setLoading(false);
+      setMounted(true);
+    }
+  };
+
   useEffect(() => {
     if (!hasReset.current) {
-      resetEnvironment();
       hasReset.current = true;
+      handleReset();
     }
   }, []);
 
-  useEffect(() => {
-    console.log(itemStatuses);
-  }, [itemStatuses]);
-
-  const handleAction = async (actionMessage) => {
-    const remaining = Number(observation?.audit_budget_remaining);
-    if (Number.isFinite(remaining) && remaining === 0) {
-      console.warn("Audit budget exhausted. Blocking step action.");
-      return { observation };
-    }
-
-    console.log("Sending action:", actionMessage);
-    const res = await fetch(`${API_BASE}/step`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({
-        action: { message: actionMessage },
-      }),
-    });
-
-    const data = await res.json();
-    console.log("BACKEND RESPONSE:", data);
-    console.log("FULL RESPONSE:", data);
-    syncFromObservation(data?.observation);
-    return data;
-  };
-
   const allowedReasonCodes = observation?.allowed_reason_codes || [];
+  const riskByItem = observation?.risk_by_item || {};
+  const done = Boolean(observation?.done);
+  const finalScore = observation?.final_score;
+
+  const reviewedCount = useMemo(
+    () => Object.values(itemStatus).filter((status) => status !== "unreviewed").length,
+    [itemStatus]
+  );
 
   const policyRows = useMemo(() => {
     if (!observation?.company_policy) return [];
@@ -288,11 +237,50 @@ export default function Dashboard() {
     ];
   }, [observation]);
 
-  const getItemId = (item, index) => resolveItemId(item, index);
+  const handleApprove = (itemId) => {
+    const resolvedItemId = String(itemId || "").trim().toUpperCase();
+    if (!resolvedItemId || loading || done || itemStatus[resolvedItemId] !== "unreviewed") {
+      return;
+    }
+    handleStep({ action_type: "approve", item_id: resolvedItemId });
+  };
 
-  const getStatus = (item, index) => {
-    const itemId = getItemId(item, index);
-    return itemStatuses?.[itemId] ?? item?.status ?? "unreviewed";
+  const handleFlagClick = (item, index) => {
+    const itemId = resolveItemId(item, index);
+    if (loading || done || itemStatus[itemId] !== "unreviewed") return;
+
+    const suggestion = getSuggestedFlagReason({
+      item,
+      itemId,
+      policy: observation?.company_policy,
+      riskByItem,
+      allowedReasonCodes,
+    });
+
+    setSelectedItem({ ...item, id: itemId });
+    setSelectedReason(suggestion.reasonCode);
+    setShowFlagModal(true);
+  };
+
+  const handleFlagConfirm = () => {
+    if (!selectedItem || loading || done) return;
+    const itemId = String(selectedItem.id ?? selectedItem.item_id ?? "").trim().toUpperCase();
+    if (!itemId || itemStatus[itemId] !== "unreviewed") return;
+
+    const reasonCode = selectedReason || allowedReasonCodes[0];
+    setShowFlagModal(false);
+    setSelectedItem(null);
+    setSelectedReason("");
+    handleStep({
+      action_type: "flag",
+      item_id: itemId,
+      reason_code: reasonCode,
+    });
+  };
+
+  const handleFinalise = () => {
+    if (loading || done) return;
+    handleStep({ action_type: "finalise" });
   };
 
   const toggleExplanation = (itemId) => {
@@ -302,121 +290,7 @@ export default function Dashboard() {
     }));
   };
 
-  const handleApprove = async (itemId) => {
-    const remaining = Number(observation?.audit_budget_remaining);
-    if (Number.isFinite(remaining) && remaining === 0) return;
-    if (actionLoading) return;
-    if ((itemStatuses?.[itemId] ?? "unreviewed") !== "unreviewed") return;
-
-    setActionLoading(true);
-    setPendingItemId(itemId);
-    setPendingAction("approve");
-
-    try {
-      await handleAction(`approve item ${itemId}`);
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setActionLoading(false);
-      setPendingItemId(null);
-      setPendingAction("");
-    }
-  };
-
-  const deriveDefaultReason = (item) => {
-    const suggested = getSuggestedFlagReason({
-      item,
-      itemId: resolveItemId(item),
-      policy: observation?.company_policy,
-      riskByItem: riskScores,
-      allowedReasonCodes,
-    });
-
-    const derived = suggested.reasonCode;
-    if (!derived) {
-      if (allowedReasonCodes.includes("NEEDS_INFO")) return "NEEDS_INFO";
-      return allowedReasonCodes[0] || "NEEDS_INFO";
-    }
-    if (allowedReasonCodes.length === 0) return derived;
-    if (allowedReasonCodes.includes(derived)) return derived;
-    if (allowedReasonCodes.includes("NEEDS_INFO")) return "NEEDS_INFO";
-    return allowedReasonCodes[0];
-  };
-
-  const handleFlagClick = (item, index) => {
-    const remaining = Number(observation?.audit_budget_remaining);
-    if (Number.isFinite(remaining) && remaining === 0) return;
-    const itemId = resolveItemId(item, index);
-    if ((itemStatuses?.[itemId] ?? "unreviewed") !== "unreviewed") return;
-    console.log(item);
-    console.log("Selected item:", item);
-    const normalizedItem = {
-      ...item,
-      id: itemId,
-    };
-
-    const defaultReason = deriveDefaultReason(normalizedItem);
-    setSuggestedReason(defaultReason);
-    setSelectedReason(defaultReason);
-    setSelectedItem({
-      ...normalizedItem,
-    });
-    setShowFlagModal(true);
-  };
-
-  const handleFlagConfirm = async () => {
-    const remaining = Number(observation?.audit_budget_remaining);
-    if (Number.isFinite(remaining) && remaining === 0) return;
-    if (
-      !selectedItem ||
-      (!selectedItem.id && !selectedItem.item_id && !selectedItem.expense_id)
-    ) {
-      console.error("Invalid selected item", selectedItem);
-      return;
-    }
-    const itemId =
-      selectedItem.id ?? selectedItem.item_id ?? selectedItem.expense_id;
-    if ((itemStatuses?.[itemId] ?? "unreviewed") !== "unreviewed") return;
-
-    const reasonToSend =
-      selectedReason ||
-      (allowedReasonCodes.includes("NEEDS_INFO")
-        ? "NEEDS_INFO"
-        : allowedReasonCodes[0] || "NEEDS_INFO");
-
-    console.log("Flag confirmed", itemId);
-    console.log("Sending ID:", itemId);
-    console.log("Sending reason:", reasonToSend);
-    console.log("Flagging item:", itemId);
-
-    if (actionLoading) return;
-    setActionLoading(true);
-    setPendingItemId(itemId);
-    setPendingAction("flag");
-
-    try {
-      await handleAction(`flag item ${itemId} as ${reasonToSend}`);
-    } catch (error) {
-      console.error("Backend error:", error);
-    } finally {
-      setShowFlagModal(false);
-      setSelectedItem(null);
-      setSelectedReason("");
-      setSuggestedReason("");
-      setActionLoading(false);
-      setPendingItemId(null);
-      setPendingAction("");
-    }
-  };
-
-  const getStatusBadgeClass = (status) => {
-    if (status === "approved") return "bg-emerald-100 text-emerald-700 border-emerald-200";
-    if (status === "flagged") return "bg-rose-100 text-rose-700 border-rose-200";
-    if (status === "needs_info") return "bg-amber-100 text-amber-700 border-amber-200";
-    return "bg-white/50 text-gray-700 border-white/60";
-  };
-
-  if (loading) {
+  if (loading && !observation) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-[#ff9a9e] via-[#a18cd1] to-[#89f7fe] p-10">
         <div className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-6xl items-center justify-center">
@@ -429,33 +303,31 @@ export default function Dashboard() {
     );
   }
 
-  if (!observation) return null;
+  if (!observation) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-[#ff9a9e] via-[#a18cd1] to-[#89f7fe] p-10">
+        <div className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-6xl items-center justify-center">
+          <div className="rounded-2xl border border-white/50 bg-white/40 p-6 shadow-lg backdrop-blur-xl">
+            <p className="text-lg font-medium text-gray-900">Unable to load dashboard.</p>
+            <p className="mt-1 text-sm text-gray-700">{error || "Please try resetting the scenario."}</p>
+            <button
+              type="button"
+              onClick={handleReset}
+              className="mt-4 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const messages = observation.messages || [];
-  const totalItems = items.length;
-  const budgetRemainingRaw = observation?.audit_budget_remaining;
-  const budgetRemaining = Number(budgetRemainingRaw);
-  const hasBudgetValue =
-    budgetRemainingRaw !== undefined &&
-    budgetRemainingRaw !== null &&
-    Number.isFinite(budgetRemaining);
-  const budgetExhausted = hasBudgetValue && budgetRemaining === 0;
-  const budgetTotalRaw =
-    observation?.audit_budget_total ??
-    observation?.audit_budget ??
-    (hasBudgetValue ? budgetRemaining : null);
-  const budgetTotal = Number(budgetTotalRaw);
-  const budgetTotalDisplay = Number.isFinite(budgetTotal)
-    ? budgetTotal
-    : hasBudgetValue
-      ? budgetRemaining
-      : "-";
-
-  const reviewedCount =
-    typeof reviewedCountState === "number"
-      ? reviewedCountState
-      : Object.values(itemStatuses).filter((status) => status !== "unreviewed").length;
-  const aiExplanations = observation?.ai_explanations || {};
+  const budgetRemaining = Number(observation.audit_budget_remaining ?? 0);
+  const budgetTotal = Number(observation.audit_budget_total ?? 0);
+  const budgetExhausted = Number.isFinite(budgetRemaining) && budgetRemaining <= 0;
+  const canFinalise = !loading && !done;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#ff9a9e] via-[#a18cd1] to-[#89f7fe] p-10">
@@ -476,26 +348,55 @@ export default function Dashboard() {
               </p>
             </div>
 
+            {error ? (
+              <section className="rounded-xl border border-rose-200 bg-rose-50 p-4 shadow">
+                <p className="text-sm font-medium text-rose-700">{error}</p>
+              </section>
+            ) : null}
+
             <div className="space-y-8">
               <div className="mb-6 rounded-xl bg-white/40 p-4 shadow">
-                <h2 className="text-lg font-semibold text-gray-800">
-                  Final Score: {Number(observation.final_score ?? 0).toFixed(4)}
-                </h2>
-                <p className="text-gray-600">
-                  Reviewed: {reviewedCount} / {totalItems}
-                </p>
-                <p className="text-gray-600">
-                  Actions Remaining: {hasBudgetValue ? budgetRemaining : "-"} /{" "}
-                  {budgetTotalDisplay}
-                </p>
-                {reviewedCount >= totalItems && totalItems > 0 && (
-                  <p className="mt-2 text-sm font-semibold text-gray-800">Audit Completed!</p>
-                )}
-                {budgetExhausted && (
-                  <p className="mt-2 text-sm font-semibold text-rose-700">
-                    Audit budget exhausted. Please reset to continue.
+                <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                  <div>
+                    <h2 className="text-lg font-semibold text-gray-800">
+                      Final Score: {finalScore == null ? "--" : Number(finalScore).toFixed(4)}
+                    </h2>
+                    <p className="text-gray-600">
+                      Reviewed: {reviewedCount} / {items.length}
+                    </p>
+                    <p className="text-gray-600">
+                      Actions Remaining: {budgetRemaining} / {budgetTotal}
+                    </p>
+                  </div>
+                  <div className="flex gap-3">
+                    <button
+                      type="button"
+                      onClick={handleReset}
+                      disabled={loading}
+                      className="rounded-xl border border-gray-300 bg-white px-4 py-2 text-sm font-semibold text-gray-800 shadow-sm transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {loading ? "Working..." : "Reset"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleFinalise}
+                      disabled={!canFinalise}
+                      className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-md transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-300"
+                    >
+                      {loading ? "Working..." : "Finalise Audit"}
+                    </button>
+                  </div>
+                </div>
+                {done ? (
+                  <p className="mt-3 text-sm font-semibold text-emerald-700">
+                    Audit completed successfully. Final score recorded.
                   </p>
-                )}
+                ) : null}
+                {budgetExhausted && !done ? (
+                  <p className="mt-2 text-sm font-semibold text-rose-700">
+                    Audit budget exhausted. Finalise or reset to continue.
+                  </p>
+                ) : null}
               </div>
 
               <section className="rounded-xl border border-white/50 bg-white/40 p-4 shadow-lg backdrop-blur-xl">
@@ -515,9 +416,9 @@ export default function Dashboard() {
 
               <AIInsights
                 items={items}
-                itemStatuses={itemStatuses}
+                itemStatuses={itemStatus}
                 policy={observation.company_policy}
-                riskByItem={riskScores}
+                riskByItem={riskByItem}
               />
 
               <section>
@@ -540,45 +441,33 @@ export default function Dashboard() {
                   <h2 className="text-lg font-semibold text-gray-900">Expense Items</h2>
                   <p className="text-sm text-gray-700">{items.length} items</p>
                 </div>
-                <ProgressBar itemStatuses={itemStatuses} />
+                <ProgressBar itemStatuses={itemStatus} />
 
                 <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
-                  {items?.map((item, index) => {
-                    const itemId = getItemId(item, index);
-                    const status = getStatus(item, index);
+                  {items.map((item, index) => {
+                    const itemId = resolveItemId(item, index);
+                    const status = itemStatus[itemId] ?? "unreviewed";
                     const merchant = item.merchant_descriptor || item.merchant || "Unknown Merchant";
                     const amount = item.submitted_amount ?? item.amount ?? 0;
-                    const riskValue = riskScores?.[itemId] ?? observation?.risk_by_item?.[itemId];
-                    const syncedRiskValue = riskScores?.[itemId];
+                    const riskValue = riskByItem[itemId];
                     const risk = getRiskPresentation(riskValue);
                     const suggestion = getSuggestedFlagReason({
                       item,
                       itemId,
-                      policy: observation?.company_policy,
-                      riskByItem: riskScores,
+                      policy: observation.company_policy,
+                      riskByItem,
                       allowedReasonCodes,
                     });
-                    const isPendingRow = actionLoading && pendingItemId === itemId;
-                    const explanation = aiExplanations?.[itemId];
-                    const hasAiExplanation = Boolean(explanation);
-                    const explanationRiskScore = hasAiExplanation
-                      ? clampRiskScore(explanation?.risk_score)
-                      : clampRiskScore(syncedRiskValue ?? riskValue);
-                    const severity = hasAiExplanation
-                      ? getSeverityPresentationFromScore(explanationRiskScore)
-                      : getSeverityPresentation("UNKNOWN");
-                    const explanationDecisionHint = hasAiExplanation
-                      ? explanation?.decision_hint || "N/A"
-                      : "N/A";
-                    const explanationReasons = Array.isArray(explanation?.reasons)
-                      ? explanation.reasons
-                      : [];
+                    const actionLocked = loading || done || status !== "unreviewed";
                     const explanationExpanded = Boolean(expandedExplanations[itemId]);
+                    const highRisk = Number(riskValue) > 0.8;
 
                     return (
                       <div
                         key={itemId}
-                        className={`rounded-2xl border border-white/50 bg-white/40 p-5 shadow-lg backdrop-blur-xl transition duration-300 hover:scale-[1.02] ${risk.cardClass}`}
+                        className={`rounded-2xl border bg-white/40 p-5 shadow-lg backdrop-blur-xl transition duration-300 hover:scale-[1.02] ${
+                          highRisk ? "border-red-300 shadow-[0_0_15px_rgba(255,0,0,0.18)]" : risk.cardClass
+                        }`}
                       >
                         <div className="mb-4 flex items-start justify-between gap-3">
                           <div>
@@ -609,28 +498,18 @@ export default function Dashboard() {
                           <button
                             type="button"
                             onClick={() => handleApprove(itemId)}
-                            disabled={
-                              actionLoading ||
-                              status !== "unreviewed" ||
-                              observation.done ||
-                              budgetExhausted
-                            }
+                            disabled={actionLocked}
                             className="flex-1 rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white shadow-md transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:bg-emerald-300"
                           >
-                            {isPendingRow && pendingAction === "approve" ? "Sending..." : "Approve"}
+                            {loading ? "Working..." : "Approve"}
                           </button>
                           <button
                             type="button"
                             onClick={() => handleFlagClick(item, index)}
-                            disabled={
-                              actionLoading ||
-                              status !== "unreviewed" ||
-                              observation.done ||
-                              budgetExhausted
-                            }
+                            disabled={actionLocked}
                             className="flex-1 rounded-xl bg-rose-500 px-4 py-2 text-sm font-semibold text-white shadow-md transition hover:bg-rose-600 disabled:cursor-not-allowed disabled:bg-rose-300"
                           >
-                            {isPendingRow && pendingAction === "flag" ? "Sending..." : "Flag"}
+                            {loading ? "Working..." : "Flag"}
                           </button>
                         </div>
 
@@ -640,83 +519,68 @@ export default function Dashboard() {
                             onClick={() => toggleExplanation(itemId)}
                             className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100"
                           >
-                            {explanationExpanded ? "Hide AI Explanation" : "Show AI Explanation"}
+                            {explanationExpanded ? "Hide Details" : "Show Details"}
                           </button>
                         </div>
 
-                        {explanationExpanded && (
+                        {explanationExpanded ? (
                           <div className="mt-4 rounded-xl border border-white/70 bg-white/70 p-4 shadow-sm">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span
-                                className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${severity.badgeClass}`}
-                              >
-                                {severity.label}
-                              </span>
-                              <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-semibold text-slate-700">
-                                Risk Score: {explanationRiskScore.toFixed(2)}
-                              </span>
-                              <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs font-semibold text-indigo-700">
-                                Hint: {String(explanationDecisionHint).toUpperCase()}
-                              </span>
-                            </div>
-
-                            <div className="mt-3">
-                              <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200">
-                                <div
-                                  className={`h-full rounded-full transition-all duration-300 ${severity.barClass}`}
-                                  style={{ width: `${Math.round(explanationRiskScore * 100)}%` }}
-                                />
-                              </div>
-                            </div>
-
-                            <div className="mt-3">
-                              {hasAiExplanation && explanationReasons.length > 0 ? (
-                                <ul className="list-disc space-y-1 pl-5 text-sm text-gray-700">
-                                  {explanationReasons.map((reason, reasonIndex) => (
-                                    <li key={`${itemId}-reason-${reasonIndex}`}>{reason}</li>
-                                  ))}
-                                </ul>
-                              ) : (
-                                <p className="text-sm text-gray-700">No AI explanation available yet.</p>
-                              )}
-                            </div>
+                            <p className="text-sm text-gray-700">
+                              Risk Score: {Number(riskValue ?? 0).toFixed(2)}
+                            </p>
+                            <p className="mt-1 text-sm text-gray-700">
+                              Current Status: <span className="font-semibold capitalize">{status}</span>
+                            </p>
+                            <p className="mt-2 text-sm text-gray-700">
+                              Receipt Present: {item.receipt_present ? "Yes" : "No"}
+                            </p>
                           </div>
-                        )}
+                        ) : null}
                       </div>
                     );
                   })}
                 </div>
               </section>
 
-              {observation.final_report && (
+              {done ? (
+                <section className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 shadow">
+                  <h2 className="text-lg font-semibold text-emerald-800">Audit Result</h2>
+                  <p className="mt-1 text-sm text-emerald-700">
+                    Final Score: {finalScore == null ? "--" : Number(finalScore).toFixed(4)}
+                  </p>
+                  <p className="mt-1 text-sm text-emerald-700">Audit finalised successfully.</p>
+                </section>
+              ) : null}
+
+              {observation.final_report ? (
                 <section className="rounded-xl bg-white/40 p-4 shadow">
                   <h2 className="text-lg font-semibold text-gray-800">Final Report</h2>
                   <p className="mt-1 text-sm text-gray-700">
                     {observation.final_report.summary || "Final report received."}
                   </p>
                 </section>
-              )}
+              ) : null}
             </div>
           </div>
         </div>
       </div>
-      {showFlagModal && (
+
+      {showFlagModal ? (
         <FlagModal
           item={selectedItem}
           onClose={() => {
+            if (loading) return;
             setShowFlagModal(false);
             setSelectedItem(null);
             setSelectedReason("");
-            setSuggestedReason("");
           }}
           onConfirm={handleFlagConfirm}
-          loading={actionLoading}
+          loading={loading}
           selectedReason={selectedReason}
           onReasonChange={setSelectedReason}
           allowedReasonCodes={allowedReasonCodes}
-          suggestedReason={suggestedReason}
         />
-      )}
+      ) : null}
     </div>
   );
 }
@@ -729,7 +593,6 @@ function FlagModal({
   selectedReason,
   onReasonChange,
   allowedReasonCodes,
-  suggestedReason,
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
@@ -745,23 +608,18 @@ function FlagModal({
           <select
             id="reason-code"
             value={selectedReason}
-            onChange={(e) => onReasonChange(e.target.value)}
+            onChange={(event) => onReasonChange(event.target.value)}
             disabled={loading || allowedReasonCodes.length === 0}
-            className={`w-full rounded-lg border px-3 py-2 text-sm text-gray-800 focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:bg-gray-100 ${
-              selectedReason === suggestedReason
-                ? "border-emerald-400 focus:border-emerald-500 focus:ring-emerald-300"
-                : "border-gray-300 focus:border-indigo-500 focus:ring-indigo-300"
-            }`}
+            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:cursor-not-allowed disabled:bg-gray-100"
           >
             {allowedReasonCodes.length > 0 ? (
               allowedReasonCodes.map((reason) => (
                 <option key={reason} value={reason}>
                   {reason}
-                  {reason === suggestedReason ? " (Recommended)" : ""}
                 </option>
               ))
             ) : (
-              <option value="NEEDS_INFO">NEEDS_INFO</option>
+              <option value="">No reasons available</option>
             )}
           </select>
         </div>
@@ -769,23 +627,21 @@ function FlagModal({
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700"
+            disabled={loading}
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 disabled:cursor-not-allowed disabled:opacity-60"
           >
             Cancel
           </button>
           <button
             type="button"
-            onClick={() => {
-              onConfirm();
-            }}
-            disabled={loading}
+            onClick={onConfirm}
+            disabled={loading || !selectedReason}
             className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-rose-300"
           >
-            {loading ? "Sending..." : "Confirm Flag"}
+            {loading ? "Working..." : "Confirm Flag"}
           </button>
         </div>
       </div>
     </div>
   );
 }
-

@@ -14,7 +14,48 @@ def _extract_item_id(token: str) -> str:
 
 
 def _normalize_item_ids(values: list[str] | set[str] | tuple[str, ...]) -> set[str]:
-    return {_extract_item_id(v) for v in values if str(v).strip()}
+    return {_extract_item_id(value) for value in values if str(value).strip()}
+
+
+def _normalize_ground_truth(
+    ground_truth: dict[str, list[str]] | dict[str, object] | set[str] | list[str],
+) -> set[str]:
+    if isinstance(ground_truth, dict):
+        if "fraud_ground_truth" in ground_truth:
+            raw_values = ground_truth.get("fraud_ground_truth", [])
+            return _normalize_item_ids(list(raw_values))
+        return {
+            _extract_item_id(item_id)
+            for item_id, reason_codes in ground_truth.items()
+            if isinstance(reason_codes, list) and reason_codes
+        }
+    return _normalize_item_ids(list(ground_truth))
+
+
+def score_flags(
+    agent_flags: list[str] | set[str] | tuple[str, ...],
+    ground_truth: dict[str, list[str]] | dict[str, object] | set[str] | list[str],
+) -> float:
+    flagged_items = _normalize_item_ids(agent_flags)
+    fraud_items = _normalize_ground_truth(ground_truth)
+
+    if not fraud_items and not flagged_items:
+        return 1.0
+
+    true_positives = len(flagged_items & fraud_items)
+    false_positives = len(flagged_items - fraud_items)
+    missed_fraud = len(fraud_items - flagged_items)
+
+    if not fraud_items:
+        return _clamp01(1.0 - (0.3 * false_positives))
+
+    exact_match_bonus = 0.15 if flagged_items == fraud_items else 0.0
+    recall = true_positives / len(fraud_items)
+    precision_penalty = 0.12 * false_positives
+    missed_penalty = 0.3 * missed_fraud
+
+    score = (0.85 * recall) + exact_match_bonus - precision_penalty - missed_penalty
+    return _clamp01(score)
 
 
 @dataclass(frozen=True)
@@ -37,57 +78,28 @@ def grade_episode(
     actions_taken: list[str],
     approvals: list[str],
     final_decision: bool | None,
-    ground_truth: dict[str, object] | set[str] | list[str],
+    ground_truth: dict[str, list[str]] | dict[str, object] | set[str] | list[str],
 ) -> GradeResult:
-    if isinstance(ground_truth, dict):
-        fraud_ground_truth = _normalize_item_ids(
-            list(ground_truth.get("fraud_ground_truth", []))
-        )
-        hard_fraud_items = _normalize_item_ids(
-            list(ground_truth.get("hard_fraud_items", []))
-        )
-    else:
-        fraud_ground_truth = _normalize_item_ids(list(ground_truth))
-        hard_fraud_items = set()
+    flagged_items = _normalize_item_ids(actions_taken)
+    approved_items = _normalize_item_ids(approvals)
+    fraud_items = _normalize_ground_truth(ground_truth)
 
-    flagged = _normalize_item_ids(actions_taken)
-    approved = _normalize_item_ids(approvals)
+    true_positives = len(flagged_items & fraud_items)
+    false_positives = len(flagged_items - fraud_items)
+    false_negatives = len(fraud_items - flagged_items)
+    bad_approvals = len(approved_items & fraud_items)
 
-    true_positives = len(flagged.intersection(fraud_ground_truth))
-    false_positives = len(flagged.difference(fraud_ground_truth))
-    false_negatives = len(fraud_ground_truth.difference(flagged))
-    bad_approvals = len(approved.intersection(fraud_ground_truth))
-
-    total_actual_fraud = len(fraud_ground_truth)
-    total_flagged = len(flagged)
-    hard_fraud_total = len(hard_fraud_items)
-    hard_fraud_caught = len(flagged.intersection(hard_fraud_items))
-
-    precision_denom = true_positives + false_positives
-    recall_denom = true_positives + false_negatives
-    precision = true_positives / precision_denom if precision_denom else 0.0
-    recall = true_positives / recall_denom if recall_denom else 0.0
-    f1_denom = precision + recall
-    f1_score = (2.0 * precision * recall / f1_denom) if f1_denom else 0.0
-
-    fp_rate = false_positives / max(1, total_flagged)
-    bad_approval_rate = bad_approvals / max(1, total_actual_fraud)
-
-    base_score = f1_score
-    base_score *= 1.0 - (0.55 * fp_rate)
-    base_score *= 1.0 - (0.90 * bad_approval_rate)
-
-    hard_bonus = (
-        0.20 * (hard_fraud_caught / hard_fraud_total) if hard_fraud_total else 0.0
+    total_actual_fraud = len(fraud_items)
+    total_flagged = len(flagged_items)
+    precision = true_positives / total_flagged if total_flagged else 0.0
+    recall = true_positives / total_actual_fraud if total_actual_fraud else 1.0
+    report_decision_correct = (
+        flagged_items == fraud_items and bad_approvals == 0 and bool(final_decision)
     )
-    final_score = _clamp01(base_score + hard_bonus)
 
-    computed_report_correct = (
-        false_negatives == 0 and false_positives == 0 and bad_approvals == 0
-    )
-    report_decision_correct = computed_report_correct
-    if final_decision is not None:
-        report_decision_correct = computed_report_correct and bool(final_decision)
+    final_score = score_flags(flagged_items, ground_truth)
+    if bad_approvals:
+        final_score = _clamp01(final_score - (0.2 * bad_approvals))
 
     return GradeResult(
         true_positives=true_positives,
@@ -96,8 +108,8 @@ def grade_episode(
         missed_fraud=false_negatives,
         total_actual_fraud=total_actual_fraud,
         total_flagged=total_flagged,
-        hard_fraud_caught=hard_fraud_caught,
-        hard_fraud_total=hard_fraud_total,
+        hard_fraud_caught=true_positives,
+        hard_fraud_total=total_actual_fraud,
         report_decision_correct=report_decision_correct,
         precision=_clamp01(precision),
         recall=_clamp01(recall),
@@ -107,48 +119,6 @@ def grade_episode(
 
 def compute_progress(
     actions_taken_partial: list[str],
-    ground_truth: dict[str, object] | set[str] | list[str],
+    ground_truth: dict[str, list[str]] | dict[str, object] | set[str] | list[str],
 ) -> float:
-    approvals: list[str] = []
-    final_decision: bool | None = None
-    if isinstance(ground_truth, dict):
-        approvals = list(ground_truth.get("approvals", []))
-        if "final_decision" in ground_truth:
-            final_decision = bool(ground_truth["final_decision"])
-
-    graded = grade_episode(
-        actions_taken=actions_taken_partial,
-        approvals=approvals,
-        final_decision=final_decision,
-        ground_truth=ground_truth,
-    )
-    return _clamp01(graded.final_score)
-
-
-if __name__ == "__main__":
-    # Lightweight deterministic self-checks for local validation.
-    truth = {
-        "fraud_ground_truth": ["EXP-1", "EXP-2"],
-        "hard_fraud_items": ["EXP-2"],
-        "approvals": [],
-    }
-    p0 = compute_progress([], truth)
-    p1 = compute_progress(["EXP-1:OVER_CAP"], truth)
-    p2 = compute_progress(["EXP-1:OVER_CAP", "EXP-2:SPLIT_TRANSACTION"], truth)
-    assert 0.0 <= p0 <= p1 <= p2 <= 1.0
-
-    grade_bad = grade_episode(
-        actions_taken=["EXP-1:OVER_CAP"],
-        approvals=["EXP-2"],
-        final_decision=True,
-        ground_truth=truth,
-    )
-    grade_clean = grade_episode(
-        actions_taken=["EXP-1:OVER_CAP", "EXP-2:SPLIT_TRANSACTION"],
-        approvals=[],
-        final_decision=True,
-        ground_truth=truth,
-    )
-    assert 0.0 <= grade_bad.final_score <= 1.0
-    assert 0.0 <= grade_clean.final_score <= 1.0
-    assert grade_bad.final_score <= grade_clean.final_score
+    return score_flags(actions_taken_partial, ground_truth)

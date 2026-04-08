@@ -7,10 +7,9 @@ from datetime import datetime
 from random import Random
 from uuid import uuid4
 
-from openenv.core.env_server.interfaces import Environment
 from pydantic import ConfigDict, Field
 
-from models import (
+from server.models import (
     AuditGuardAction,
     AuditGuardObservation,
     AuditGuardState,
@@ -19,7 +18,9 @@ from models import (
     FinalReport,
     ScenarioInstance,
 )
-from server.grading import compute_progress, grade_episode
+from server.grading import compute_progress
+from server.rules_engine import evaluate_rules as rules_engine
+from server.scoring import ScoreResult, score_audit
 from server.scenario_factory import make_scenario
 
 
@@ -41,7 +42,7 @@ class ExtendedFinalReport(FinalReport):
     recall: float = Field(..., ge=0, le=1)
 
 
-class AuditGuardEnvironment(Environment):
+class AuditGuardEnvironment:
     """Scenario-driven AuditGuard environment."""
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -67,6 +68,7 @@ class AuditGuardEnvironment(Environment):
         self.split_transaction_items: set[str] = set()
         self.flagged_items: set[str] = set()
         self.correct_flagged_items: set[str] = set()
+        self.ground_truth: dict[str, list[str]] = {}
         self.fraud_ground_truth: set[str] = set()
         self.fraud_reasons_by_item: dict[str, list[str]] = {}
         self.cumulative_score: float = 0.0
@@ -78,15 +80,20 @@ class AuditGuardEnvironment(Environment):
         return max(0.0, min(1.0, value))
 
     def _grading_ground_truth(self) -> dict[str, object]:
+        hard_fraud_items = [
+            item_id
+            for item_id, reason_codes in self.ground_truth.items()
+            if "DUPLICATE" in reason_codes or "SPLIT_TRANSACTION" in reason_codes
+        ]
         return {
             "fraud_ground_truth": sorted(self.fraud_ground_truth),
-            "hard_fraud_items": sorted(self.split_transaction_items),
+            "hard_fraud_items": sorted(hard_fraud_items),
             "approvals": list(self._state.approvals),
             "total_items": len(self._scenario.items) if self._scenario else 0,
         }
 
     def _current_progress(self) -> float:
-        return self._clamp01(compute_progress(self._state.flags, self._grading_ground_truth()))
+        return self._clamp01(compute_progress(self._state.flags, self.ground_truth))
 
     def _progress_reward(self, progress_old: float, progress_new: float) -> float:
         return round(self._clamp01(max(0.0, progress_new - progress_old)), 4)
@@ -94,6 +101,17 @@ class AuditGuardEnvironment(Environment):
     def _normalized_binary_reward(self, raw_reward: int) -> float:
         bounded = max(-1, min(1, int(raw_reward)))
         return round(self._clamp01((bounded + 1) / 2), 4)
+
+    def _score_current_audit(self, risk_by_item: dict[str, float] | None = None) -> ScoreResult:
+        if self._scenario is None:
+            raise ValueError("Environment not initialized")
+
+        return score_audit(
+            items=self._scenario.items,
+            item_status=self._item_status,
+            fraud_ground_truth=self.fraud_ground_truth,
+            risk_by_item=risk_by_item or getattr(self, "risk_by_item", {}),
+        )
 
     def _item_risk(
         self,
@@ -240,6 +258,7 @@ class AuditGuardEnvironment(Environment):
         reward: float = 0.0,
         final_report: FinalReport | None = None,
         final_score: float | None = None,
+        accuracy: float | None = None,
     ) -> AuditGuardObservation:
         merchant_counts = Counter(i.merchant_descriptor for i in scenario_data.items)
         self.detect_fraud_patterns()
@@ -320,6 +339,8 @@ class AuditGuardEnvironment(Environment):
             reward=reward,
             final_report=final_report,
             final_score=final_score,
+            accuracy=accuracy,
+            breakdown=final_report.breakdown if final_report is not None else None,
             metadata={},
         )
 
@@ -519,32 +540,41 @@ class AuditGuardEnvironment(Environment):
 
         return ("invalid", None, None, None)
 
-    def _compute_final_report(self) -> ExtendedFinalReport:
-        graded = grade_episode(
-            actions_taken=self._state.flags,
-            approvals=self._state.approvals,
-            final_decision=True,
-            ground_truth=self._grading_ground_truth(),
-        )
-        final_score = round(self._clamp01(graded.final_score), 4)
+    def _compute_final_report(
+        self,
+        risk_by_item: dict[str, float] | None = None,
+    ) -> ExtendedFinalReport:
+        scored = self._score_current_audit(risk_by_item=risk_by_item)
+        final_score = round(self._clamp01(scored.final_score), 4)
         final_report = {
-            "true_positives": graded.true_positives,
-            "false_positives": graded.false_positives,
-            "false_negatives": graded.false_negatives,
-            "missed_fraud": graded.missed_fraud,
-            "total_actual_fraud": graded.total_actual_fraud,
-            "total_flagged": graded.total_flagged,
-            "precision": graded.precision,
-            "recall": graded.recall,
-            "hard_fraud_caught": graded.hard_fraud_caught,
-            "hard_fraud_total": graded.hard_fraud_total,
-            "report_decision_correct": graded.report_decision_correct,
+            "true_positives": scored.true_positives,
+            "false_positives": scored.false_positives,
+            "false_negatives": scored.false_negatives,
+            "missed_fraud": scored.missed_frauds,
+            "accuracy_percentage": scored.accuracy_percentage,
+            "total_items": scored.total_items,
+            "correct_actions": scored.correct_actions,
+            "wrong_flags": scored.wrong_flags,
+            "critical_mistakes_count": scored.critical_mistakes_count,
+            "breakdown": {
+                "correct": scored.breakdown.correct,
+                "wrong_flags": scored.breakdown.wrong_flags,
+                "missed_frauds": scored.breakdown.missed_frauds,
+                "critical": scored.breakdown.critical,
+            },
+            "total_actual_fraud": scored.hard_fraud_total,
+            "total_flagged": len(self.flagged_items),
+            "precision": scored.precision,
+            "recall": scored.recall,
+            "hard_fraud_caught": scored.hard_fraud_caught,
+            "hard_fraud_total": scored.hard_fraud_total,
+            "report_decision_correct": scored.report_decision_correct,
             "final_score": final_score,
             "summary": (
-                "Final report: caught "
-                f"{graded.true_positives} of {graded.total_actual_fraud} fraud items, "
-                f"flagged {graded.total_flagged} items, {graded.false_positives} false "
-                f"positives, score {final_score}."
+                "Final report: "
+                f"{scored.correct_actions}/{scored.total_items} correct actions, "
+                f"{scored.wrong_flags} wrong flags, {scored.missed_frauds} missed frauds, "
+                f"{scored.critical_mistakes_count} critical mistakes, score {final_score}."
             ),
         }
 
@@ -568,13 +598,17 @@ class AuditGuardEnvironment(Environment):
         except ValueError:
             scenario_data = make_scenario("easy", seed)
         self._scenario = scenario_data
+        self.ground_truth = rules_engine(
+            scenario_data.items,
+            scenario_data.company_policy,
+        )
         self._item_status = {item.item_id: "unreviewed" for item in scenario_data.items}
         self.audit_budget_total = scenario_data.audit_budget_total
         self.audit_budget_remaining = self.audit_budget_total
         self.detect_fraud_patterns()
-        self.fraud_ground_truth = set(self.duplicate_items) | set(
-            self.split_transaction_items
-        )
+        self.fraud_ground_truth = {
+            item_id for item_id, reason_codes in self.ground_truth.items() if reason_codes
+        }
         self.flagged_items = set()
         self.correct_flagged_items = set()
         self.cumulative_score = 0.0
@@ -604,8 +638,37 @@ class AuditGuardEnvironment(Environment):
 
     def step(self, action: AuditGuardAction) -> AuditGuardObservation:  # type: ignore[override]
         """Step handler with idempotent safeguards for duplicate/invalid actions."""
+        if getattr(action, "action_type", None) == "finalise":
+            if self._scenario is None:
+                raise ValueError("Environment not initialized")
+
+            preview_observation = self._build_observation(self._scenario)
+            final_report = self._compute_final_report(
+                risk_by_item=preview_observation.risk_by_item
+            )
+            score = final_report.final_score
+            self._state.finalised = True
+            self._state.final_score = score
+            self._final_report = final_report
+            self.progress_score = score
+            self.cumulative_score = score
+
+            return self._build_observation(
+                self._scenario,
+                messages=["Audit finalised successfully."],
+                done=True,
+                reward=score,
+                final_report=final_report,
+                final_score=score,
+                accuracy=final_report.accuracy_percentage,
+            )
+
         if self._scenario is None:
             self._scenario = make_scenario("easy", 0)
+            self.ground_truth = rules_engine(
+                self._scenario.items,
+                self._scenario.company_policy,
+            )
             self._item_status = {
                 item.item_id: "unreviewed" for item in self._scenario.items
             }
@@ -613,25 +676,24 @@ class AuditGuardEnvironment(Environment):
             self.audit_budget_remaining = self.audit_budget_total
             self._state.audit_budget_remaining = self.audit_budget_remaining
             self.detect_fraud_patterns()
+            self.fraud_ground_truth = {
+                item_id for item_id, reason_codes in self.ground_truth.items() if reason_codes
+            }
         else:
             self.detect_fraud_patterns()
-        self.fraud_ground_truth = set(self.duplicate_items) | set(
-            self.split_transaction_items
-        )
+            self.fraud_ground_truth = {
+                item_id for item_id, reason_codes in self.ground_truth.items() if reason_codes
+            }
 
         scenario_data = self._scenario
+
         text = action.message.strip()
         message = text.lower()
-        if action.kind == "finalise" or "finalise report" in message:
-            action_type, item_id, reason_code, note = ("finalise", None, None, None)
-        elif message == "auto audit":
-            action_type, item_id, reason_code, note = ("auto_audit", None, None, None)
-        else:
-            action_type, item_id, reason_code, note = self._parse_action_message(text)
+        action_type = action.action_type.strip().lower().replace(" ", "_")
+        item_id = action.item_id.upper() if action.item_id else None
+        reason_code = action.reason_code.upper() if action.reason_code else None
+        note = action.note
 
-        valid_ids = {item.item_id for item in scenario_data.items}
-
-        # Early return: already finalised, no mutation.
         if self._state.finalised:
             self._state.last_action_error = "Episode is already finalised."
             return self._build_observation(
@@ -641,14 +703,37 @@ class AuditGuardEnvironment(Environment):
                 reward=0.0,
                 final_report=self._final_report,
                 final_score=self._state.final_score,
+                accuracy=(
+                    self._final_report.accuracy_percentage
+                    if self._final_report is not None
+                    else None
+                ),
             )
+
+        if action_type == "auto_audit" or message == "auto audit":
+            action_type, item_id, reason_code, note = ("auto_audit", None, None, None)
+        elif action_type in {"approve", "flag", "request_info"}:
+            if item_id is None and text:
+                parsed_action_type, parsed_item_id, parsed_reason_code, parsed_note = (
+                    self._parse_action_message(text)
+                )
+                action_type = parsed_action_type
+                item_id = parsed_item_id
+                reason_code = parsed_reason_code
+                note = parsed_note
+        elif text:
+            action_type, item_id, reason_code, note = self._parse_action_message(text)
+        else:
+            action_type, item_id, reason_code, note = ("invalid", None, None, None)
+
+        valid_ids = {item.item_id for item in scenario_data.items}
 
         # Early return: invalid format, unknown item, duplicate item interaction.
         if action_type == "invalid":
             self._state.last_action_error = (
                 "Invalid action format. Use: 'flag item EXP-001 as OVER_CAP', "
                 "'approve item EXP-002', 'request info for EXP-003 <details>', "
-                "or set kind='finalise'."
+                "or set action_type='finalise'."
             )
             return self._build_observation(
                 scenario_data,
@@ -730,25 +815,7 @@ class AuditGuardEnvironment(Environment):
                 final_score=None,
             )
 
-        if action_type == "finalise":
-            self._state.finalised = True
-            done = True
-            final_report = self._compute_final_report()
-            final_score = round(self._clamp01(final_report.final_score), 4)
-            self._final_report = final_report
-            self._state.final_score = final_score
-            progress_new = final_score
-            self.progress_score = progress_new
-            self.cumulative_score = progress_new
-            step_reward_raw = 1 if final_report.report_decision_correct else -1
-            reward = self._normalized_binary_reward(step_reward_raw)
-            if not hasattr(self, "messages"):
-                self.messages = []
-            self.messages.append(f"Final Score: {round(final_score * 100, 2)}%")
-            messages.append(f"Final Score: {round(final_score * 100, 2)}%")
-            messages.append("Report finalised.")
-
-        elif action_type == "auto_audit":
+        if action_type == "auto_audit":
             unreviewed_items = [
                 item
                 for item in scenario_data.items
@@ -815,15 +882,17 @@ class AuditGuardEnvironment(Environment):
 
             self._state.finalised = True
             done = True
-            final_report = self._compute_final_report()
+            preview_observation = self._build_observation(scenario_data)
+            final_report = self._compute_final_report(
+                risk_by_item=preview_observation.risk_by_item
+            )
             final_score = round(self._clamp01(final_report.final_score), 4)
             self._final_report = final_report
             self._state.final_score = final_score
             progress_new = final_score
             self.progress_score = progress_new
             self.cumulative_score = progress_new
-            step_reward_raw = 1 if final_report.report_decision_correct else -1
-            reward = self._normalized_binary_reward(step_reward_raw)
+            reward = final_score
 
             messages.append(
                 f"Auto audit completed: reviewed {reviewed_count}/{len(ranked_items)} items using available budget, "
@@ -920,6 +989,11 @@ class AuditGuardEnvironment(Environment):
             reward=reward,
             final_report=final_report,
             final_score=final_score,
+            accuracy=(
+                final_report.accuracy_percentage
+                if final_report is not None
+                else None
+            ),
         )
 
     @property
